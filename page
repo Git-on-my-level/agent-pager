@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""Page a human from an agent or script. Standard library only, so it works when everything else is down.
+
+  page [--sev info|wake] [--title T] [--url U] [--dedupe KEY] [--window SECONDS] [--source NAME] MESSAGE
+  page test [--sev info|wake] [--loud]   send a test; a wake test stays quiet unless --loud
+  page status                            show backends and recent sends; never prints secrets
+
+Severity decides the route. By default wake tries bark, then ntfy, and rings through mute and Do Not Disturb on bark.
+info goes to ntfy, then bark. Repeats of a key inside its window are suppressed (wake 15 minutes, info 1 hour). A failed
+send is not recorded, so a retry goes out. Past 6 wakes an hour, further wakes go out as info: a looping agent can't
+keep ringing the phone.
+
+Exit 0 means a backend accepted it or it was suppressed as a repeat, 1 means every backend failed or none is set up,
+2 means bad usage. Accepted doesn't mean seen: neither backend reports that the human read it.
+
+Secrets are one file each, by default ~/.config/page/secrets/bark-key and ntfy-topic (mode 0600). A backend without a
+file is skipped. ~/.config/page/config.json is optional; see the README. A config that can't be used is reported and
+ignored, so a bad edit can't silence a page. State that can't be used, or a lock held past 15 seconds, is reported and
+skipped, so that page goes out without suppression or the cap. $PAGE_CONFIG_DIR and $PAGE_STATE_DIR override the two
+directories.
+"""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import socket
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+MAX_CHARS = 240
+TIMEOUT_SECONDS = 10
+KEEP_SECONDS = 86400
+LOCK_WAIT_SECONDS = 15
+TOKEN = re.compile(
+    r"[A-Za-z0-9_\-+/=]{24,}"
+    r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    r"|(?i:\b(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+)"
+)
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+DEFAULTS = {
+    "routes": {"wake": ["bark", "ntfy"], "info": ["ntfy", "bark"]},
+    "windows": {"wake": 900, "info": 3600},
+    "wake_cap_per_hour": 6,
+    "backends": {
+        "bark": {"server": "https://api.day.app", "secret_file": "secrets/bark-key", "volume": 5},
+        "ntfy": {"server": "https://ntfy.sh", "secret_file": "secrets/ntfy-topic"},
+    },
+}
+SEVERITIES = ("wake", "info")
+
+
+def config_dir():
+    return Path(os.environ.get("PAGE_CONFIG_DIR") or Path.home() / ".config/page")
+
+
+def state_dir():
+    return Path(os.environ.get("PAGE_STATE_DIR") or Path.home() / ".local/state/page")
+
+
+def is_int(value, minimum):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def is_safe_server(server):
+    parts = urllib.parse.urlsplit(server)
+    return (parts.scheme == "https" and bool(parts.hostname)) or (
+        parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1")
+    )
+
+
+def validate(raw):
+    """Merges a parsed config over the defaults, raising ValueError on anything it can't use."""
+    if not isinstance(raw, dict):
+        raise ValueError("not a JSON object")
+    unknown = set(raw) - set(DEFAULTS)
+    if unknown:
+        raise ValueError(f"unknown keys {sorted(unknown)}")
+    config = json.loads(json.dumps(DEFAULTS))
+    for sev, route in raw.get("routes", {}).items():
+        if sev not in SEVERITIES or not isinstance(route, list) or not route:
+            raise ValueError(f"bad route {sev}")
+        if any(name not in BACKENDS for name in route):
+            raise ValueError(f"route {sev} names an unknown backend")
+        config["routes"][sev] = route
+    for sev, window in raw.get("windows", {}).items():
+        if sev not in SEVERITIES or not is_int(window, 0):
+            raise ValueError(f"bad window {sev}")
+        config["windows"][sev] = window
+    if "wake_cap_per_hour" in raw:
+        if not is_int(raw["wake_cap_per_hour"], 1):
+            raise ValueError("bad wake_cap_per_hour")
+        config["wake_cap_per_hour"] = raw["wake_cap_per_hour"]
+    for name, settings in raw.get("backends", {}).items():
+        if name not in BACKENDS or not isinstance(settings, dict):
+            raise ValueError(f"bad backend {name}")
+        extra = set(settings) - set(DEFAULTS["backends"][name])
+        if extra:
+            raise ValueError(f"backend {name} has unknown keys {sorted(extra)}")
+        for key in ("server", "secret_file"):
+            if key in settings and not (isinstance(settings[key], str) and settings[key]):
+                raise ValueError(f"bad {name} {key}")
+        if "server" in settings and not is_safe_server(settings["server"]):
+            raise ValueError(f"{name} server must use https, or http on this machine: the secret is in the URL")
+        if "volume" in settings and not (is_int(settings["volume"], 0) and settings["volume"] <= 10):
+            raise ValueError(f"bad {name} volume")
+        config["backends"][name].update(settings)
+    return config
+
+
+def load_config():
+    """Returns (config, problem). A missing file is normal; a bad one falls back to the defaults."""
+    path = config_dir() / "config.json"
+    try:
+        return validate(json.loads(path.read_text())), None
+    except FileNotFoundError:
+        return json.loads(json.dumps(DEFAULTS)), None
+    except Exception as error:  # Whatever is wrong with the file, the page still has to go out.
+        return json.loads(json.dumps(DEFAULTS)), f"{path} ignored: {error}"
+
+
+def secret(config, name):
+    path = Path(config["backends"][name]["secret_file"]).expanduser()
+    try:
+        return (config_dir() / path).read_text().strip() or None
+    except (OSError, ValueError):
+        return None
+
+
+def post(url, data, headers):
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with OPENER.open(request, timeout=TIMEOUT_SECONDS) as response:
+        response.read()
+
+
+def send_bark(config, message, loud):
+    settings = config["backends"]["bark"]
+    body = {"title": message["title"], "body": message["text"], "group": "page-" + message["sev"], "level": "active"}
+    if loud:
+        body.update(level="critical", volume=settings["volume"], call="1")
+    if message["url"]:
+        body["url"] = message["url"]
+    url = f"{settings['server'].rstrip('/')}/{secret(config, 'bark')}"
+    post(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+
+
+def send_ntfy(config, message, loud):
+    settings = config["backends"]["ntfy"]
+    headers = {"Title": message["title"].encode("ascii", "replace").decode(), "Priority": "5" if loud else "3"}
+    if message["url"]:
+        headers["Click"] = message["url"]
+    post(f"{settings['server'].rstrip('/')}/{secret(config, 'ntfy')}", message["text"].encode(), headers)
+
+
+BACKENDS = {"bark": send_bark, "ntfy": send_ntfy}
+
+
+def failure_reason(error):
+    """Names the failure without the error's text, which can contain a URL holding the secret."""
+    if isinstance(error, urllib.error.HTTPError):
+        return f"http {error.code}"
+    return type(error).__name__
+
+
+def deliver(config, message, loud):
+    """Tries each set-up backend on the route in order. Returns (backend or None, failure reasons)."""
+    failures = []
+    for name in config["routes"][message["sev"]]:
+        if not secret(config, name):
+            continue
+        try:
+            BACKENDS[name](config, message, loud)
+            return name, failures
+        except Exception as error:  # Any failure, such as a truncated response, moves on to the next backend.
+            failures.append(f"{name}: {failure_reason(error)}")
+    return None, failures
+
+
+def is_entry(entry):
+    return (
+        isinstance(entry, dict)
+        and isinstance(entry.get("at"), (int, float))
+        and all(isinstance(entry.get(field), str) for field in ("key", "sev", "backend"))
+    )
+
+
+def read_log():
+    try:
+        lines = (state_dir() / "sent.jsonl").read_text().splitlines()
+    except (OSError, ValueError):
+        return []
+    now = time.time()
+    entries = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if is_entry(entry) and now - entry["at"] < KEEP_SECONDS:
+            entries.append(entry)
+    return entries
+
+
+def write_log(entries):
+    path = state_dir() / "sent.jsonl"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    temporary.replace(path)
+
+
+def clean(text):
+    """Keeps a message short and masks anything shaped like a token. The text goes through third-party servers."""
+    return TOKEN.sub("[masked]", " ".join(text.split()))[:MAX_CHARS]
+
+
+def clean_url(url):
+    """Drops any login and masks tokens in the query and fragment. The path stays as it is so the link still opens."""
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+    except ValueError:
+        return None
+    query, fragment = TOKEN.sub("[masked]", parts.query), TOKEN.sub("[masked]", parts.fragment)
+    cleaned = urllib.parse.urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, query, fragment))
+    return urllib.parse.quote(cleaned, safe="%/:=&?~#+!$,;'@()*[]")
+
+
+def open_lock():
+    """Returns the held lock, or None if it can't be had soon. An unrecorded page beats one lost to bad state or a hang."""
+    try:
+        state_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock = open(state_dir() / "lock", "w")
+    except OSError:
+        return None
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except OSError:
+            if time.monotonic() >= deadline:
+                lock.close()
+                return None
+            time.sleep(0.1)
+
+
+def run_page(sev, text, title, url, dedupe, window, source, loud=None):
+    config, problem = load_config()
+    if problem:
+        print(f"page: {problem}", file=sys.stderr)
+    host = socket.gethostname().split(".")[0]
+    message = {
+        "sev": sev,
+        "text": clean(text),
+        "title": clean(title or f"{sev}: {source or host}"),
+        "url": clean_url(url) if url else None,
+    }
+    if not message["text"]:
+        print("page: empty message", file=sys.stderr)
+        return 2
+    key = hashlib.sha256((dedupe or f"{message['title']}|{message['text']}").encode()).hexdigest()[:16]
+    window = config["windows"][sev] if window is None else window
+    cap = config["wake_cap_per_hour"]
+    loud = sev == "wake" if loud is None else loud
+
+    lock = open_lock()
+    if lock is None:
+        print("page: state unavailable, sending without suppression or the wake cap", file=sys.stderr)
+    with lock or contextlib.nullcontext():
+        entries = read_log() if lock else []
+        now = time.time()
+        if any(e["key"] == key and e.get("asked") == sev and now - e["at"] < window for e in entries):
+            print(f"page: suppressed repeat of {key} (window {window}s)")
+            return 0
+        if loud and sum(bool(e.get("rang")) and now - e["at"] < 3600 for e in entries) >= cap:
+            print(f"page: over {cap} wakes an hour, sending as info", file=sys.stderr)
+            message["sev"] = "info"
+            message["title"] = clean("wake cap: " + message["title"])
+            loud = False
+        backend, failures = deliver(config, message, loud)
+        for failure in failures:
+            print(f"page: {failure}", file=sys.stderr)
+        if backend is None:
+            print("page: not sent, " + ("every backend failed" if failures else "no backend set up"), file=sys.stderr)
+            return 1
+        if lock:
+            entries.append(
+                {"at": now, "key": key, "asked": sev, "sev": message["sev"], "rang": loud, "backend": backend, "source": source}
+            )
+            try:
+                write_log(entries)
+            except OSError as error:
+                print(f"page: sent but not recorded: {type(error).__name__}", file=sys.stderr)
+    print(f"page: sent sev={message['sev']} via {backend}")
+    return 0
+
+
+def run_status():
+    config, problem = load_config()
+    if problem:
+        print(f"config: {problem}")
+    for name in BACKENDS:
+        print(f"{name}: {'set up' if secret(config, name) else 'no secret file'}")
+    for entry in read_log()[-10:]:
+        when = time.strftime("%m-%dT%H:%M:%SZ", time.gmtime(entry["at"]))
+        print(f"{when} {entry['sev']} via {entry['backend']} key={entry['key']} source={entry.get('source')}")
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["status"]:
+        argparse.ArgumentParser(prog="page status").parse_args(argv[1:])
+        return run_status()
+    if argv[:1] == ["test"]:
+        parser = argparse.ArgumentParser(prog="page test")
+        parser.add_argument("--sev", choices=["info", "wake"], default="info")
+        parser.add_argument("--loud", action="store_true", help="really ring: a wake test is quiet without this")
+        args = parser.parse_args(argv[1:])
+        return run_page(
+            args.sev, f"page test from {socket.gethostname().split('.')[0]}", "Page test", None, None, 0, "test",
+            loud=args.loud,
+        )
+    parser = argparse.ArgumentParser(prog="page", description=__doc__.split("\n")[0])
+    parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument("--sev", choices=["info", "wake"], default="info")
+    parser.add_argument("--title")
+    parser.add_argument("--url", help="opened when the notification is tapped, such as a ticket or dashboard")
+    parser.add_argument("--dedupe", help="repeats of this key inside the window are suppressed")
+    parser.add_argument("--window", type=int, help="seconds; defaults to the configured window for the severity")
+    parser.add_argument("--source", help="who is paging, shown in the default title")
+    parser.add_argument("message")
+    args = parser.parse_args(argv)
+    return run_page(args.sev, args.message, args.title, args.url, args.dedupe, args.window, args.source)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

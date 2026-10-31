@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+secrets/
+config.json
+!skills/agentctl-pack.json

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "skills": [
+    {
+      "name": "page",
+      "path": "skills/page",
+      "targets": ["claude", "codex", "cursor", "hermes", "omp"]
+    }
+  ]
+}
