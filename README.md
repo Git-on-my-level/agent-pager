@@ -46,7 +46,7 @@ Do Not Disturb without it.
 | Severity | Default route | On the phone |
 | --- | --- | --- |
 | `info` | ntfy, then Bark | A normal notification |
-| `wake` | Bark, then ntfy | Bark rings through mute and Do Not Disturb for 30 seconds; the ntfy fallback uses max priority, which we found showed as a normal notification on iOS |
+| `wake` | Bark, then ntfy | Bark rings through mute and Do Not Disturb for 30 seconds; the ntfy fallback uses max priority, which we found showed as a normal notification on iOS, so its output says `may not have rung` |
 
 Keep `wake` to a short list of things worth waking someone for. Everything else is `info`.
 
@@ -55,8 +55,9 @@ Keep `wake` to a short list of things worth waking someone for. Everything else 
 - Repeats of a key inside its window are suppressed: 15 minutes for `wake`, 1 hour for `info`. Without `--dedupe`, the
   key comes from the title and message.
 - Past 6 wakes an hour, further wakes go out as `info`.
-- Messages are capped at 240 characters, and anything shaped like a token is masked. That can catch long file paths
-  too, so put links in `--url`. In a URL, only the query and fragment are masked, and any login is removed.
+- Messages are capped at 240 characters, and anything shaped like a token is masked. Long runs that read as joined-up
+  words, such as branch names and paths, are kept, while hashes and UUIDs are masked. In a URL, only the query and
+  fragment are masked, and any login is removed.
 - If the state directory can't be used, or another `page` holds its lock for more than 15 seconds, the page goes out
   anyway without suppression or the cap. A duplicate is better than a lost page.
 
@@ -89,8 +90,10 @@ you pass `--title` or `--source`, and `page test` always includes it.
 ```
 
 `secret_file` is relative to the config directory, or an absolute or `~` path. `server` lets you use a self-hosted Bark
-or ntfy server, over https, or http on the same machine, because the secret is part of the URL. If the file can't be used, `page` reports that, ignores all of it and uses the defaults, so a bad edit
-can't silence a page. `page status` shows whether that has happened.
+or ntfy server, over https, or http on the same machine, because the secret is part of the URL. A bad setting is reported
+and keeps its default, and the rest of the file still applies, so a bad edit can't silence a page. If the file isn't valid
+JSON, all of it is ignored, so a secret at a custom path won't be found until it's fixed. `page status` shows whether
+either has happened.
 
 ## Agent skill
 

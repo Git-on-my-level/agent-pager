@@ -98,6 +98,11 @@ class PageTest(unittest.TestCase):
         self.assertEqual(self.backends(), ["bark", "ntfy"])
         self.assertEqual(self.server.requests[1]["headers"]["Priority"], "5")
         self.assertIn("bark: http 500", result.stderr)
+        self.assertIn("via ntfy, may not have rung", result.stdout)
+
+    def test_a_wake_that_rang_does_not_hedge_and_a_quiet_test_says_so(self):
+        self.assertEqual(self.page("--sev", "wake", "lead is down").stdout.strip(), "page: sent sev=wake via bark")
+        self.assertIn("via bark, quiet", self.page("test", "--sev", "wake").stdout)
 
     def test_missing_backend_is_skipped(self):
         (self.root / "config/secrets/bark-key").unlink()
@@ -217,6 +222,40 @@ class PageTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0)
                 self.assertIn("ignored", result.stdout)
 
+    def test_a_bad_setting_keeps_the_rest_of_the_config(self):
+        elsewhere = self.root / "managed-key"
+        elsewhere.write_text("elsewhere-key\n")
+        (self.root / "config/secrets/bark-key").unlink()
+        for bad in ({"typo_key": 1}, {"wake_cap_per_hour": 0}, {"routes": {"wake": []}}, {"windows": 5}):
+            with self.subTest(bad=bad):
+                self.write_config({"backends": {"bark": {"secret_file": str(elsewhere)}}, **bad})
+                self.server.requests.clear()
+                result = self.page("--sev", "wake", "--window", "0", "lead is down")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("ignored", result.stderr)
+                self.assertEqual(self.server.requests[0]["secret"], "elsewhere-key")
+
+    def test_a_bad_backend_setting_keeps_the_other_backend_settings(self):
+        elsewhere = self.root / "managed-key"
+        elsewhere.write_text("elsewhere-key\n")
+        (self.root / "config/secrets/bark-key").unlink()
+        self.write_config({"backends": {"bark": {"secret_file": str(elsewhere), "volume": 11}}})
+        result = self.page("--sev", "wake", "lead is down")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.server.requests[0]["secret"], "elsewhere-key")
+        self.assertEqual(json.loads(self.server.requests[0]["body"])["volume"], 5)
+
+    def test_an_unparseable_server_keeps_the_secret_path(self):
+        # The default server is never contacted: the bad setting is only checked, and status sends nothing.
+        elsewhere = self.root / "managed-key"
+        elsewhere.write_text("elsewhere-key\n")
+        (self.root / "config/secrets/bark-key").unlink()
+        (self.root / "config/config.json").write_text(json.dumps(
+            {"backends": {"bark": {"secret_file": str(elsewhere), "server": "https://[bad"}}}))
+        output = self.page("status").stdout
+        self.assertIn("partly ignored", output)
+        self.assertIn("bark: set up", output)
+
     def test_bad_config_falls_back_to_defaults_when_paging(self):
         # No secrets, so the default servers are never contacted.
         directory = self.root / "bad"
@@ -299,6 +338,45 @@ class PageTest(unittest.TestCase):
         self.assertNotIn("AKIAIOSFODNN7EXAMPLE", body)
         self.assertNotIn("hunter2", body)
         self.assertIn("here", body)
+
+    def test_readable_identifiers_stay_readable(self):
+        for text in (
+            "see card:agent-fleet-token-efficiency-david-10-30",
+            "branch driver-failover-allowlist-alert failed",
+            "/Volumes/Ephemeral/scratch/worktrees/hostctl-config-fo1 is full",
+            "Codex token: expired on m4-mini",
+            "Grok api_key: missing on m1",
+        ):
+            with self.subTest(text=text):
+                self.page("--window", "0", text)
+                self.assertEqual(self.server.requests[-1]["body"].decode(), text)
+
+    def test_credential_shapes_are_still_masked(self):
+        for secret in (
+            "abcdefghijklmnopqrstuvwxyz0123",
+            "aB3xY9kL2mN4-pQ7rS1tU5vW8zC6",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "dGhpcyBpcyBhIHRlc3Qgc3RyaW5n+==",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "token: abc123",
+            "Bearer my-long-lived-access-token-2026-11-01",
+            "token=expired",
+            "api_key: abcdefghijklmnop",
+            "my_password=correct-horse-battery-staple-long",
+            "secret: missing",
+        ):
+            with self.subTest(secret=secret):
+                self.page("--window", "0", f"before {secret} after")
+                body = self.server.requests[-1]["body"].decode()
+                self.assertNotIn(secret, body)
+                self.assertIn("[masked]", body)
+
+    def test_url_query_keeps_a_readable_value(self):
+        self.page("--sev", "wake", "--url", "https://example.test/c?card=agent-fleet-resilience-david-10-30", "x")
+        self.assertEqual(
+            json.loads(self.server.requests[0]["body"])["url"],
+            "https://example.test/c?card=agent-fleet-resilience-david-10-30",
+        )
 
     def test_status_rejects_extra_arguments(self):
         self.assertEqual(self.page("status", "unexpected").returncode, 2)

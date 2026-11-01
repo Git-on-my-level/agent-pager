@@ -46,6 +46,7 @@ page --sev wake --dedupe "lead-down" --source failover --url "<link>" "Lead sile
 | 0, `sent` | A backend accepted it | Report it as sent, not as seen |
 | 0, `suppressed` | Same key inside its window | Nothing; don't change the key to get past it |
 | 0, stderr says `sending as info` | Over the hourly wake cap, so it didn't ring | Say in your report that it didn't ring |
+| 0, `may not have rung` | The ringing backend failed and a fallback accepted it | Say in your report that it may not have rung, and use any other channel you have if it matters |
 | 1 | Every backend failed, or none is set up | Report it and use any other channel you have |
 | 2 | Bad usage | Fix the command |
 

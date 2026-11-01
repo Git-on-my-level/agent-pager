@@ -14,8 +14,8 @@ Exit 0 means a backend accepted it or it was suppressed as a repeat, 1 means eve
 2 means bad usage. Accepted doesn't mean seen: neither backend reports that the human read it.
 
 Secrets are one file each, by default ~/.config/page/secrets/bark-key and ntfy-topic (mode 0600). A backend without a
-file is skipped. ~/.config/page/config.json is optional; see the README. A config that can't be used is reported and
-ignored, so a bad edit can't silence a page. State that can't be used, or a lock held past 15 seconds, is reported and
+file is skipped. ~/.config/page/config.json is optional; see the README. A bad setting is reported and ignored, and the
+rest of the file still applies, so a bad edit can't silence a page. State that can't be used, or a lock held past 15 seconds, is reported and
 skipped, so that page goes out without suppression or the cap. $PAGE_CONFIG_DIR and $PAGE_STATE_DIR override the two
 directories.
 """
@@ -40,11 +40,16 @@ MAX_CHARS = 240
 TIMEOUT_SECONDS = 10
 KEEP_SECONDS = 86400
 LOCK_WAIT_SECONDS = 15
-TOKEN = re.compile(
-    r"[A-Za-z0-9_\-+/=]{24,}"
-    r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
-    r"|(?i:\b(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+)"
+SECRET_FIELD = re.compile(
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    r"|(?i:(?:password|passwd|secret)\s*[=:]\s*\S+)"
+    r"|(?i:\bbearer\s+\S+)"
+    r"|(?i:(?:token|api[_-]?key)\s*=\s*\S+)"
+    # After a colon, "token: expired" is a sentence. A value with a digit or some length is treated as a credential.
+    r"|(?i:(?:token|api[_-]?key)\s*:\s*(?=\S*\d|\S{16})\S+)"
 )
+LONG_RUN = re.compile(r"[A-Za-z0-9_\-+/=]{24,}")
+READABLE_PART = re.compile(r"[A-Z]?[a-z]{1,18}|[A-Z]{1,19}|\d{1,8}|[A-Za-z0-9]{1,7}")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 DEFAULTS = {
     "routes": {"wake": ["bark", "ntfy"], "info": ["ntfy", "bark"]},
@@ -56,6 +61,7 @@ DEFAULTS = {
     },
 }
 SEVERITIES = ("wake", "info")
+RINGS_THROUGH_MUTE = {"bark"}
 
 
 def config_dir():
@@ -71,56 +77,80 @@ def is_int(value, minimum):
 
 
 def is_safe_server(server):
-    parts = urllib.parse.urlsplit(server)
+    try:
+        parts = urllib.parse.urlsplit(server)
+    except ValueError:
+        return False
     return (parts.scheme == "https" and bool(parts.hostname)) or (
         parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1")
     )
 
 
+def section(raw, name, problems):
+    value = raw.get(name, {})
+    if isinstance(value, dict):
+        return value
+    problems.append(f"{name} is not an object")
+    return {}
+
+
+def backend_setting_problem(name, key, value):
+    if key not in DEFAULTS["backends"][name]:
+        return f"backend {name} has unknown key {key}"
+    if key in ("server", "secret_file") and not (isinstance(value, str) and value):
+        return f"bad {name} {key}"
+    if key == "server" and not is_safe_server(value):
+        return f"{name} server must use https, or http on this machine: the secret is in the URL"
+    if key == "volume" and not (is_int(value, 0) and value <= 10):
+        return f"bad {name} volume"
+    return None
+
+
 def validate(raw):
-    """Merges a parsed config over the defaults, raising ValueError on anything it can't use."""
+    """Merges a parsed config over the defaults, returning (config, problems). A bad setting keeps its default and the
+    rest still apply, because the setting that says where the secrets are may be fine."""
+    config = json.loads(json.dumps(DEFAULTS))
     if not isinstance(raw, dict):
-        raise ValueError("not a JSON object")
+        return config, ["not a JSON object"]
+    problems = []
     unknown = set(raw) - set(DEFAULTS)
     if unknown:
-        raise ValueError(f"unknown keys {sorted(unknown)}")
-    config = json.loads(json.dumps(DEFAULTS))
-    for sev, route in raw.get("routes", {}).items():
-        if sev not in SEVERITIES or not isinstance(route, list) or not route:
-            raise ValueError(f"bad route {sev}")
-        if any(name not in BACKENDS for name in route):
-            raise ValueError(f"route {sev} names an unknown backend")
-        config["routes"][sev] = route
-    for sev, window in raw.get("windows", {}).items():
-        if sev not in SEVERITIES or not is_int(window, 0):
-            raise ValueError(f"bad window {sev}")
-        config["windows"][sev] = window
+        problems.append(f"unknown keys {sorted(unknown)}")
+    for sev, route in section(raw, "routes", problems).items():
+        usable = isinstance(route, list) and route and all(isinstance(name, str) and name in BACKENDS for name in route)
+        if sev in SEVERITIES and usable:
+            config["routes"][sev] = route
+        else:
+            problems.append(f"bad route {sev}")
+    for sev, window in section(raw, "windows", problems).items():
+        if sev in SEVERITIES and is_int(window, 0):
+            config["windows"][sev] = window
+        else:
+            problems.append(f"bad window {sev}")
     if "wake_cap_per_hour" in raw:
-        if not is_int(raw["wake_cap_per_hour"], 1):
-            raise ValueError("bad wake_cap_per_hour")
-        config["wake_cap_per_hour"] = raw["wake_cap_per_hour"]
-    for name, settings in raw.get("backends", {}).items():
+        if is_int(raw["wake_cap_per_hour"], 1):
+            config["wake_cap_per_hour"] = raw["wake_cap_per_hour"]
+        else:
+            problems.append("bad wake_cap_per_hour")
+    for name, settings in section(raw, "backends", problems).items():
         if name not in BACKENDS or not isinstance(settings, dict):
-            raise ValueError(f"bad backend {name}")
-        extra = set(settings) - set(DEFAULTS["backends"][name])
-        if extra:
-            raise ValueError(f"backend {name} has unknown keys {sorted(extra)}")
-        for key in ("server", "secret_file"):
-            if key in settings and not (isinstance(settings[key], str) and settings[key]):
-                raise ValueError(f"bad {name} {key}")
-        if "server" in settings and not is_safe_server(settings["server"]):
-            raise ValueError(f"{name} server must use https, or http on this machine: the secret is in the URL")
-        if "volume" in settings and not (is_int(settings["volume"], 0) and settings["volume"] <= 10):
-            raise ValueError(f"bad {name} volume")
-        config["backends"][name].update(settings)
-    return config
+            problems.append(f"bad backend {name}")
+            continue
+        for key, value in settings.items():
+            problem = backend_setting_problem(name, key, value)
+            if problem:
+                problems.append(problem)
+            else:
+                config["backends"][name][key] = value
+    return config, problems
 
 
 def load_config():
-    """Returns (config, problem). A missing file is normal; a bad one falls back to the defaults."""
+    """Returns (config, problem). A missing file is normal; a bad setting falls back to its default."""
     path = config_dir() / "config.json"
     try:
-        return validate(json.loads(path.read_text())), None
+        config, problems = validate(json.loads(path.read_text()))
+        return config, f"{path} partly ignored: {'; '.join(problems)}" if problems else None
     except FileNotFoundError:
         return json.loads(json.dumps(DEFAULTS)), None
     except Exception as error:  # Whatever is wrong with the file, the page still has to go out.
@@ -216,9 +246,20 @@ def write_log(entries):
     temporary.replace(path)
 
 
+def mask_run(match):
+    """Masks a long run unless it reads as words joined up, such as a branch name, a path or a query like card=some-name."""
+    run = match.group()
+    readable = "+" not in run and all(READABLE_PART.fullmatch(part) for part in re.split(r"[-_/=]", run) if part)
+    return run if readable else "[masked]"
+
+
+def mask(text):
+    return LONG_RUN.sub(mask_run, SECRET_FIELD.sub("[masked]", text))
+
+
 def clean(text):
     """Keeps a message short and masks anything shaped like a token. The text goes through third-party servers."""
-    return TOKEN.sub("[masked]", " ".join(text.split()))[:MAX_CHARS]
+    return mask(" ".join(text.split()))[:MAX_CHARS]
 
 
 def clean_url(url):
@@ -227,7 +268,7 @@ def clean_url(url):
         parts = urllib.parse.urlsplit(url.strip())
     except ValueError:
         return None
-    query, fragment = TOKEN.sub("[masked]", parts.query), TOKEN.sub("[masked]", parts.fragment)
+    query, fragment = mask(parts.query), mask(parts.fragment)
     cleaned = urllib.parse.urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, query, fragment))
     return urllib.parse.quote(cleaned, safe="%/:=&?~#+!$,;'@()*[]")
 
@@ -298,7 +339,12 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
                 write_log(entries)
             except OSError as error:
                 print(f"page: sent but not recorded: {type(error).__name__}", file=sys.stderr)
-    print(f"page: sent sev={message['sev']} via {backend}")
+    note = ""
+    if message["sev"] == "wake" and not loud:
+        note = ", quiet"
+    elif loud and backend not in RINGS_THROUGH_MUTE:
+        note = ", may not have rung"
+    print(f"page: sent sev={message['sev']} via {backend}{note}")
     return 0
 
 
