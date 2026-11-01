@@ -37,7 +37,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 MAX_CHARS = 240
 TIMEOUT_SECONDS = 10
@@ -265,9 +265,16 @@ def write_log(entries):
     temporary.replace(path)
 
 
+def short_hostname():
+    return socket.gethostname().split(".")[0]
+
+
 def mask_run(match):
-    """Masks a long run unless it reads as words joined up, such as a branch name, a path or a query like card=some-name."""
+    """Masks a long run unless it reads as words joined up, such as a branch name, a path or a query like card=some-name.
+    This machine's own name always stays, so a page can say where it came from."""
     run = match.group()
+    if run == short_hostname():
+        return run
     readable = "+" not in run and all(READABLE_PART.fullmatch(part) for part in re.split(r"[-_/=]", run) if part)
     return run if readable else "[masked]"
 
@@ -317,7 +324,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
     config, problem = load_config()
     if problem:
         print(f"page: {problem}", file=sys.stderr)
-    host = socket.gethostname().split(".")[0]
+    host = short_hostname()
     message = {
         "sev": sev,
         "text": clean(text),
@@ -399,7 +406,7 @@ def main(argv):
         parser.add_argument("--loud", action="store_true", help="really ring: a wake test is quiet without this")
         args = parser.parse_args(argv[1:])
         return run_page(
-            args.sev, f"page test from {socket.gethostname().split('.')[0]}", "Page test", None, None, 0, "test",
+            args.sev, f"page test from {short_hostname()}", "Page test", None, None, 0, "test",
             loud=args.loud,
         )
     parser = argparse.ArgumentParser(prog="page", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

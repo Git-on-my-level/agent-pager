@@ -1,5 +1,7 @@
 """Runs the real CLI against a local fake server standing in for both backends."""
 import fcntl
+import importlib.machinery
+import importlib.util
 import json
 import os
 import subprocess
@@ -7,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -75,6 +78,15 @@ class PageTest(unittest.TestCase):
 
     def backends(self):
         return [request["backend"] for request in self.server.requests]
+
+    def test_this_machines_own_name_stays_readable(self):
+        name = "DavidMacSudioM1s-Mac-Studio"
+        loader = importlib.machinery.SourceFileLoader("page_module", str(PAGE))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("page_module", loader))
+        loader.exec_module(module)
+        with unittest.mock.patch("socket.gethostname", return_value=f"{name}.local"):
+            self.assertEqual(module.mask(f"page test from {name}"), f"page test from {name}")
+            self.assertEqual(module.mask("x DavidMacSudioM1s-Mac-Studio7 y"), "x [masked] y")
 
     def test_wake_rings_on_bark(self):
         result = self.page("--sev", "wake", "--url", "https://example.test/card", "lead is down")
