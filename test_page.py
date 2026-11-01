@@ -219,7 +219,6 @@ class PageTest(unittest.TestCase):
                 directory.mkdir()
                 (directory / "config.json").write_text(text)
                 result = self.page("status", config_dir=directory)
-                self.assertEqual(result.returncode, 0)
                 self.assertIn("ignored", result.stdout)
 
     def test_a_bad_setting_keeps_the_rest_of_the_config(self):
@@ -346,6 +345,7 @@ class PageTest(unittest.TestCase):
             "/Volumes/Ephemeral/scratch/worktrees/hostctl-config-fo1 is full",
             "Codex token: expired on m4-mini",
             "Grok api_key: missing on m1",
+            "Sol token: unavailable on m1",
         ):
             with self.subTest(text=text):
                 self.page("--window", "0", text)
@@ -359,6 +359,7 @@ class PageTest(unittest.TestCase):
             "dGhpcyBpcyBhIHRlc3Qgc3RyaW5n+==",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             "token: abc123",
+            "token: abcdefghijklmno",
             "Bearer my-long-lived-access-token-2026-11-01",
             "token=expired",
             "api_key: abcdefghijklmnop",
@@ -377,6 +378,67 @@ class PageTest(unittest.TestCase):
             json.loads(self.server.requests[0]["body"])["url"],
             "https://example.test/c?card=agent-fleet-resilience-david-10-30",
         )
+
+    def test_invalid_json_still_finds_secrets_at_the_default_paths(self):
+        # Status only: a page here would go to the default public servers.
+        (self.root / "config/config.json").write_text("{not json")
+        result = self.page("status")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("ignored", result.stdout)
+        self.assertIn("bark: set up", result.stdout)
+
+    def test_status_exit_says_whether_anything_can_send(self):
+        self.assertEqual(self.page("status").returncode, 0)
+        (self.root / "config/secrets/bark-key").unlink()
+        self.assertEqual(self.page("status").returncode, 0)
+        (self.root / "config/secrets/ntfy-topic").unlink()
+        self.assertEqual(self.page("status").returncode, 1)
+
+    def test_status_fails_when_the_only_secret_is_on_no_route(self):
+        (self.root / "config/secrets/bark-key").unlink()
+        self.write_config({"routes": {"wake": ["bark"], "info": ["bark"]}})
+        self.assertEqual(self.page("status").returncode, 1)
+
+    def test_status_shows_the_key_as_given_and_omits_a_missing_source(self):
+        self.page("--dedupe", "lead-down", "--source", "failover", "lead is down")
+        self.page("no key here")
+        lines = self.page("status").stdout.splitlines()
+        self.assertIn("key=lead-down source=failover", lines[-2])
+        self.assertNotIn("source=", lines[-1])
+
+    def test_a_window_past_a_day_still_suppresses(self):
+        self.page("--dedupe", "weekly", "--window", "172800", "first")
+        log = self.root / "state/sent.jsonl"
+        entry = json.loads(log.read_text())
+        entry["at"] -= 90000
+        log.write_text(json.dumps(entry) + "\n")
+        self.assertIn("suppressed", self.page("--dedupe", "weekly", "--window", "172800", "first").stdout)
+        entry["at"] -= 90000
+        log.write_text(json.dumps(entry) + "\n")
+        self.assertIn("sent", self.page("--dedupe", "weekly", "--window", "172800", "first").stdout)
+
+    def test_a_capped_wake_says_on_stdout_that_it_did_not_ring(self):
+        self.write_config({"wake_cap_per_hour": 1})
+        self.page("--sev", "wake", "first")
+        self.assertIn("via ntfy, capped, did not ring", self.page("--sev", "wake", "second").stdout)
+
+    def test_help_lists_the_subcommands(self):
+        output = self.page("--help").stdout
+        self.assertIn("page status", output)
+        self.assertIn("page test", output)
+
+    def test_a_separator_sends_the_word_status_as_a_message(self):
+        self.assertEqual(self.page("--", "status").returncode, 0)
+        self.assertEqual(self.server.requests[0]["body"], b"status")
+
+    def test_url_path_loses_known_credentials_and_keeps_hashes(self):
+        self.page("--sev", "wake", "--url", "https://example.test/ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890/x", "a")
+        self.assertEqual(json.loads(self.server.requests[-1]["body"])["url"], "https://example.test/[masked]/x")
+        self.page("--sev", "wake", "--url", "https://example.test/download/token=abc123", "c")
+        self.assertNotIn("abc123", json.loads(self.server.requests[-1]["body"])["url"])
+        commit = "https://example.test/o/r/commit/0ee5a15c0ee5a15c0ee5a15c0ee5a15c0ee5a15c"
+        self.page("--sev", "wake", "--url", commit, "b")
+        self.assertEqual(json.loads(self.server.requests[-1]["body"])["url"], commit)
 
     def test_status_rejects_extra_arguments(self):
         self.assertEqual(self.page("status", "unexpected").returncode, 2)

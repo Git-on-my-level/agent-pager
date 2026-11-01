@@ -7,7 +7,7 @@ description: Reach the human on their phone with the page CLI. Use when work has
 
 `page` sends a push to the human's phone. A `wake` rings through mute and Do Not Disturb, so it interrupts sleep and meetings.
 
-Run `page status` if you aren't sure it's set up. If `page` is missing or no backend is set up, say so in your report and carry on. Don't call a push service directly or write your own sender.
+Run `page status` if you aren't sure it's set up; it exits 1 if no backend is. If `page` is missing or no backend is set up, say so in your report and carry on. Don't call a push service directly or write your own sender.
 
 ## Choose the severity
 
@@ -45,7 +45,7 @@ page --sev wake --dedupe "lead-down" --source failover --url "<link>" "Lead sile
 | --- | --- | --- |
 | 0, `sent` | A backend accepted it | Report it as sent, not as seen |
 | 0, `suppressed` | Same key inside its window | Nothing; don't change the key to get past it |
-| 0, stderr says `sending as info` | Over the hourly wake cap, so it didn't ring | Say in your report that it didn't ring |
+| 0, `capped, did not ring` | Over the hourly wake cap, so it went as info | Say in your report that it didn't ring |
 | 0, `may not have rung` | The ringing backend failed and a fallback accepted it | Say in your report that it may not have rung, and use any other channel you have if it matters |
 | 1 | Every backend failed, or none is set up | Report it and use any other channel you have |
 | 2 | Bad usage | Fix the command |

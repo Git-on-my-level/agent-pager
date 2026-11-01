@@ -56,8 +56,9 @@ Keep `wake` to a short list of things worth waking someone for. Everything else 
   key comes from the title and message.
 - Past 6 wakes an hour, further wakes go out as `info`.
 - Messages are capped at 240 characters, and anything shaped like a token is masked. Long runs that read as joined-up
-  words, such as branch names and paths, are kept, while hashes and UUIDs are masked. In a URL, only the query and
-  fragment are masked, and any login is removed.
+  words, such as branch names and paths, are kept, while hashes and UUIDs are masked. In a URL, the query and fragment
+  are masked the same way, the path loses only known credential shapes so commit links still open, and any login is
+  removed.
 - If the state directory can't be used, or another `page` holds its lock for more than 15 seconds, the page goes out
   anyway without suppression or the cap. A duplicate is better than a lost page.
 
@@ -72,6 +73,9 @@ you pass `--title` or `--source`, and `page test` always includes it.
 | 0 | A backend accepted it, or it was suppressed as a repeat |
 | 1 | Every backend failed, or none is set up |
 | 2 | Bad usage |
+
+`page status` exits 0 if at least one backend is set up and 1 if none is. A message that is only the word `status` or
+`test` needs a separator: `page -- status`.
 
 ## Configuration
 
@@ -92,8 +96,8 @@ you pass `--title` or `--source`, and `page test` always includes it.
 `secret_file` is relative to the config directory, or an absolute or `~` path. `server` lets you use a self-hosted Bark
 or ntfy server, over https, or http on the same machine, because the secret is part of the URL. A bad setting is reported
 and keeps its default, and the rest of the file still applies, so a bad edit can't silence a page. If the file isn't valid
-JSON, all of it is ignored, so a secret at a custom path won't be found until it's fixed. `page status` shows whether
-either has happened.
+JSON, all of it is ignored, so a secret at a custom path won't be found until it's fixed: keep secrets at the default
+paths to stay reachable through that too. `page status` shows whether either has happened.
 
 ## Agent skill
 

@@ -3,7 +3,9 @@
 
   page [--sev info|wake] [--title T] [--url U] [--dedupe KEY] [--window SECONDS] [--source NAME] MESSAGE
   page test [--sev info|wake] [--loud]   send a test; a wake test stays quiet unless --loud
-  page status                            show backends and recent sends; never prints secrets
+  page status                            show backends and recent sends; never prints secrets; exit 1 if none is set up
+
+A message that is only the word status or test needs a separator: page -- status
 
 Severity decides the route. By default wake tries bark, then ntfy, and rings through mute and Do Not Disturb on bark.
 info goes to ntfy, then bark. Repeats of a key inside its window are suppressed (wake 15 minutes, info 1 hour). A failed
@@ -15,7 +17,8 @@ Exit 0 means a backend accepted it or it was suppressed as a repeat, 1 means eve
 
 Secrets are one file each, by default ~/.config/page/secrets/bark-key and ntfy-topic (mode 0600). A backend without a
 file is skipped. ~/.config/page/config.json is optional; see the README. A bad setting is reported and ignored, and the
-rest of the file still applies, so a bad edit can't silence a page. State that can't be used, or a lock held past 15 seconds, is reported and
+rest of the file still applies. A file that isn't valid JSON is ignored whole, so keep secrets at the default paths to
+stay reachable through that too. State that can't be used, or a lock held past 15 seconds, is reported and
 skipped, so that page goes out without suppression or the cap. $PAGE_CONFIG_DIR and $PAGE_STATE_DIR override the two
 directories.
 """
@@ -34,7 +37,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 MAX_CHARS = 240
 TIMEOUT_SECONDS = 10
@@ -46,7 +49,17 @@ SECRET_FIELD = re.compile(
     r"|(?i:\bbearer\s+\S+)"
     r"|(?i:(?:token|api[_-]?key)\s*=\s*\S+)"
     # After a colon, "token: expired" is a sentence. A value with a digit or some length is treated as a credential.
-    r"|(?i:(?:token|api[_-]?key)\s*:\s*(?=\S*\d|\S{16})\S+)"
+    r"|(?i:(?:token|api[_-]?key)\s*:\s*(?=\S*\d|\S{13})\S+)"
+)
+# A URL path keeps hashes and ids so the link still opens, so only these are masked there.
+KNOWN_CREDENTIAL = re.compile(
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    r"|\bgh[opusr]_[A-Za-z0-9]{20,}"
+    r"|\bgithub_pat_[A-Za-z0-9_]{20,}"
+    r"|\bglpat-[A-Za-z0-9_\-]{10,}"
+    r"|\bsk-[A-Za-z0-9_\-]{20,}"
+    r"|\bxox[abprs]-[A-Za-z0-9\-]{10,}"
+    r"|\bAIza[A-Za-z0-9_\-]{30,}"
 )
 LONG_RUN = re.compile(r"[A-Za-z0-9_\-+/=]{24,}")
 READABLE_PART = re.compile(r"[A-Z]?[a-z]{1,18}|[A-Z]{1,19}|\d{1,8}|[A-Za-z0-9]{1,7}")
@@ -222,6 +235,12 @@ def is_entry(entry):
     )
 
 
+def keep_seconds(entry):
+    """An entry stays as long as its window needs, so a window past a day still suppresses."""
+    window = entry.get("window")
+    return max(KEEP_SECONDS, window) if isinstance(window, int) else KEEP_SECONDS
+
+
 def read_log():
     try:
         lines = (state_dir() / "sent.jsonl").read_text().splitlines()
@@ -234,7 +253,7 @@ def read_log():
             entry = json.loads(line)
         except ValueError:
             continue
-        if is_entry(entry) and now - entry["at"] < KEEP_SECONDS:
+        if is_entry(entry) and now - entry["at"] < keep_seconds(entry):
             entries.append(entry)
     return entries
 
@@ -263,13 +282,15 @@ def clean(text):
 
 
 def clean_url(url):
-    """Drops any login and masks tokens in the query and fragment. The path stays as it is so the link still opens."""
+    """Drops any login and masks tokens in the query and fragment. The path loses only known credential shapes, so the
+    link still opens."""
     try:
         parts = urllib.parse.urlsplit(url.strip())
     except ValueError:
         return None
     query, fragment = mask(parts.query), mask(parts.fragment)
-    cleaned = urllib.parse.urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, query, fragment))
+    path = KNOWN_CREDENTIAL.sub("[masked]", SECRET_FIELD.sub("[masked]", parts.path))
+    cleaned = urllib.parse.urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], path, query, fragment))
     return urllib.parse.quote(cleaned, safe="%/:=&?~#+!$,;'@()*[]")
 
 
@@ -310,6 +331,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
     window = config["windows"][sev] if window is None else window
     cap = config["wake_cap_per_hour"]
     loud = sev == "wake" if loud is None else loud
+    capped = False
 
     lock = open_lock()
     if lock is None:
@@ -322,6 +344,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
             return 0
         if loud and sum(bool(e.get("rang")) and now - e["at"] < 3600 for e in entries) >= cap:
             print(f"page: over {cap} wakes an hour, sending as info", file=sys.stderr)
+            capped = True
             message["sev"] = "info"
             message["title"] = clean("wake cap: " + message["title"])
             loud = False
@@ -333,14 +356,17 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
             return 1
         if lock:
             entries.append(
-                {"at": now, "key": key, "asked": sev, "sev": message["sev"], "rang": loud, "backend": backend, "source": source}
+                {"at": now, "key": key, "name": clean(dedupe) if dedupe else None, "window": window, "asked": sev,
+                 "sev": message["sev"], "rang": loud, "backend": backend, "source": source}
             )
             try:
                 write_log(entries)
             except OSError as error:
                 print(f"page: sent but not recorded: {type(error).__name__}", file=sys.stderr)
     note = ""
-    if message["sev"] == "wake" and not loud:
+    if capped:
+        note = ", capped, did not ring"
+    elif message["sev"] == "wake" and not loud:
         note = ", quiet"
     elif loud and backend not in RINGS_THROUGH_MUTE:
         note = ", may not have rung"
@@ -352,12 +378,15 @@ def run_status():
     config, problem = load_config()
     if problem:
         print(f"config: {problem}")
+    set_up = [name for name in BACKENDS if secret(config, name)]
     for name in BACKENDS:
-        print(f"{name}: {'set up' if secret(config, name) else 'no secret file'}")
+        print(f"{name}: {'set up' if name in set_up else 'no secret file'}")
     for entry in read_log()[-10:]:
         when = time.strftime("%m-%dT%H:%M:%SZ", time.gmtime(entry["at"]))
-        print(f"{when} {entry['sev']} via {entry['backend']} key={entry['key']} source={entry.get('source')}")
-    return 0
+        source = f" source={entry['source']}" if entry.get("source") else ""
+        print(f"{when} {entry['sev']} via {entry['backend']} key={entry.get('name') or entry['key']}{source}")
+    routed = {name for route in config["routes"].values() for name in route}
+    return 0 if routed.intersection(set_up) else 1
 
 
 def main(argv):
@@ -373,7 +402,7 @@ def main(argv):
             args.sev, f"page test from {socket.gethostname().split('.')[0]}", "Page test", None, None, 0, "test",
             loud=args.loud,
         )
-    parser = argparse.ArgumentParser(prog="page", description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(prog="page", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--sev", choices=["info", "wake"], default="info")
     parser.add_argument("--title")
