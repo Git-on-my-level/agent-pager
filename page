@@ -392,6 +392,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None, incident=
         entries = read_log() if lock else []
         now = time.time()
         policy_reason = "legacy"
+        updated = None
         if incident:
             policy_path = state_dir() / "incidents" / (support.incident_key(source or "unattributed", incident["name"]) + ".json")
             try:
@@ -450,7 +451,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None, incident=
         if backend is None:
             print("page: not sent, " + ("every backend failed" if failures else "no backend set up"), file=sys.stderr)
             return finish(1, "failed", effective=message["sev"], reason="; ".join(failures) or "no_backend", key=key)
-        if incident and lock:
+        if incident and lock and isinstance(updated, dict):
             updated["notified"] = True
             try:
                 temp = policy_path.with_suffix(".tmp")

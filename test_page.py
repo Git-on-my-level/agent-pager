@@ -100,6 +100,20 @@ class PageTest(unittest.TestCase):
         self.assertIn("sent sev=wake", self.page(*args).stdout)
         self.assertEqual(self.backends(), ["bark", "ntfy", "bark"])
 
+    def test_corrupt_incident_state_never_crashes_after_delivery(self):
+        import datetime
+        from page_support import incident_key
+        path = self.root / 'state/incidents' / (incident_key('batch', 'custody') + '.json')
+        path.parent.mkdir(parents=True)
+        path.write_text('corrupt')
+        observed = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        result = self.page('--sev', 'wake', '--source', 'batch', '--incident', 'custody',
+                           '--observed-at', observed, '--human-action', 'Restore storage access',
+                           '--wake-after', '0', 'Audio custody needs investigation')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('sent sev=info', result.stdout)
+        self.assertEqual(path.read_text(), 'corrupt')
+
     def test_backend_failure_is_audited_and_retry_is_not_suppressed(self):
         self.server.failing = {"bark", "ntfy"}
         self.assertEqual(self.page("--source", "worker", "Build failed; investigation needed").returncode, 1)
