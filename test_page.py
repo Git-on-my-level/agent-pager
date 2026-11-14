@@ -71,15 +71,15 @@ class PageTest(unittest.TestCase):
         args = ("--sev", "wake", "--source", "batch", "--incident", "custody",
                 "--observed-at", observed, "--human-action", "Restore storage access")
         result = self.page(*args, "Audio custody needs investigation")
-        self.assertIn("sev=info", result.stdout)
+        self.assertIn("deferred triage_grace", result.stdout)
         result = self.page(*args, "--wake-after", "0", "Confirmed missing audio needs investigation")
         self.assertIn("sev=wake", result.stdout)
         result = self.page(*args, "--wake-after", "0", "Confirmed missing audio needs investigation")
         self.assertIn("suppressed", result.stdout)
-        self.assertEqual(self.backends(), ["ntfy", "bark"])
+        self.assertEqual(self.backends(), ["bark"])
         self.assertIn("Restore storage access", json.loads(self.server.requests[-1]["body"])["body"])
         rows = json.loads(self.page("callers", "--json").stdout)
-        self.assertEqual(rows[0]["outcomes"], {"sent": 2, "suppressed": 1})
+        self.assertEqual(rows[0]["outcomes"], {"deferred": 1, "sent": 1, "suppressed": 1})
 
     def test_backend_failure_is_audited_and_retry_is_not_suppressed(self):
         self.server.failing = {"bark", "ntfy"}

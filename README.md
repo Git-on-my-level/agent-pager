@@ -150,12 +150,12 @@ page --source batch-custody --incident audio-custody --sev wake \
   --url https://example.org/incident "3 audio items lack verified storage; no automatic repair"
 ```
 
-The first observation sends info. A wake needs fresh, continuous firing evidence
+The triage interval is audit-only: no phone notification. A wake needs fresh, continuous firing evidence
 for `--wake-after` seconds and a concrete `--human-action`. `--handling automatic`
-keeps it info while an effective recovery is running; an owner name alone does
+keeps it local while an effective recovery is running; an owner name alone does
 not establish recovery. The caller must stop claiming automatic handling if it
 fails. Use `--wake-after 0` only for verified imminent harm. Missing human action
-keeps an incident informational. Stale, future and unknown observations never
+keeps an incident local. Stale, future and unknown observations never
 wake or clear. Report `--condition resolved` until the recovery hold expires;
 brief clear/firing flaps retain one episode and restart the persistence clock.
 A gap beyond the evidence freshness budget restarts the firing clock.

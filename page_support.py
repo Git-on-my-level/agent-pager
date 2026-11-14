@@ -136,12 +136,12 @@ def incident_decision(previous, *, condition, observed_at, now, wake_after=600,
         if not state.get("active"):
             # Keep retrying a failed resolution delivery with the same identity;
             # transport dedupe suppresses it after acceptance.
-            return state, "info" if generation else None, "resolved" if generation else "already_resolved", generation
+            return state, "info" if state.get("notified") else None, "resolved" if generation else "already_resolved", generation
         state.setdefault("clear_since", observed_at)
         if observed_at - state["clear_since"] < resolve_after:
             return state, None, "recovery_debounce", generation
         state.update(active=False)
-        return state, "info", "resolved", generation
+        return state, "info" if state.get("notified") else None, "resolved", generation
     if not state.get("active"):
         generation += 1
         state = dict(active=True, generation=generation, first_seen=observed_at)
@@ -153,11 +153,11 @@ def incident_decision(previous, *, condition, observed_at, now, wake_after=600,
     if requested != "wake":
         return state, "info", "informational", generation
     if handling == "automatic":
-        return state, "info", "recovery_active", generation
+        return state, None, "recovery_active", generation
     if not human_action:
-        return state, "info", "no_human_action", generation
+        return state, None, "no_human_action", generation
     if observed_at - state["first_seen"] < wake_after:
-        return state, "info", "triage_grace", generation
+        return state, None, "triage_grace", generation
     return state, "wake", "human_action_required", generation
 
 

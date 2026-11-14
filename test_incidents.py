@@ -17,10 +17,10 @@ class IncidentTest(unittest.TestCase):
 
     def test_transient_firing_never_wakes(self):
         state, sev, reason, key = self.decision()
-        self.assertEqual((sev, reason), ("info", "triage_grace"))
+        self.assertEqual((sev, reason), (None, "triage_grace"))
         for at in (1060, 1120, 1180):
             state, sev, _, _ = self.decision(state, at=at)
-            self.assertEqual(sev, "info")
+            self.assertIsNone(sev)
         state, sev, _, _ = self.decision(state, at=1240, condition="resolved")
         self.assertIsNone(sev)
         self.assertTrue(state["active"])
@@ -31,8 +31,8 @@ class IncidentTest(unittest.TestCase):
             state, sev, _, key = self.decision(state, at=at)
         self.assertEqual(sev, "wake")
         self.assertEqual(key, 1)
-        self.assertEqual(self.decision(state, at=1660, handling="automatic")[1], "info")
-        self.assertEqual(self.decision(state, at=1660, human_action=None)[1], "info")
+        self.assertEqual(self.decision(state, at=1660, handling="automatic")[1], None)
+        self.assertEqual(self.decision(state, at=1660, human_action=None)[1], None)
 
     def test_verified_urgent_harm_keeps_immediate_path(self):
         self.assertEqual(self.decision(wake_after=0)[1], "wake")
@@ -50,15 +50,15 @@ class IncidentTest(unittest.TestCase):
         state, sev, _, later = self.decision(state, at=1120)
         self.assertEqual(episode, later)
         self.assertEqual(state["first_seen"], 1120)
-        self.assertEqual(sev, "info")
+        self.assertIsNone(sev)
         state, _, _, _ = self.decision(state, at=1180, condition="resolved")
         state, sev, reason, _ = self.decision(state, at=4780, condition="resolved")
-        self.assertEqual((sev, reason), ("info", "resolved"))
+        self.assertEqual((sev, reason), (None, "resolved"))
         self.assertFalse(state["active"])
         self.assertEqual(self.decision(state, at=4840)[3], episode + 1)
 
     def test_resolution_can_retry_after_transport_failure(self):
-        state = self.decision()[0]
+        state = dict(self.decision()[0], notified=True)
         state = self.decision(state, at=1060, condition="resolved", resolve_after=0)[0]
         self.assertFalse(state["active"])
         self.assertEqual(self.decision(state, at=1120, condition="resolved")[1:3], ("info", "resolved"))
@@ -66,7 +66,7 @@ class IncidentTest(unittest.TestCase):
     def test_gap_resets_continuous_risk_clock(self):
         state = self.decision()[0]
         state, severity, _, _ = self.decision(state, at=2000)
-        self.assertEqual((severity, state["first_seen"]), ("info", 2000))
+        self.assertEqual((severity, state["first_seen"]), (None, 2000))
 
     def test_audit_records_refusal_suppression_failure_and_caller_index(self):
         with tempfile.TemporaryDirectory() as root:
