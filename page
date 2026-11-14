@@ -26,10 +26,12 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -37,7 +39,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
+_support_spec = importlib.util.spec_from_file_location("page_support", Path(__file__).resolve().with_name("page_support.py"))
+support = importlib.util.module_from_spec(_support_spec)
+_support_spec.loader.exec_module(support)
 
 MAX_CHARS = 240
 TIMEOUT_SECONDS = 10
@@ -75,6 +80,40 @@ DEFAULTS = {
 }
 SEVERITIES = ("wake", "info")
 RINGS_THROUGH_MUTE = {"bark"}
+WAKE_PLACEHOLDERS = {"summary", "message", "body", "text", "test", "todo", "tbd", "placeholder"}
+DEDUPE_PLACEHOLDERS = {"key", "dedupe", "name", "id", "todo"}
+UNFILLED_TEMPLATE = re.compile(r"\{[^{}]*\}|<[^<>]*>|\$[A-Za-z_][A-Za-z0-9_]*|%s")
+
+
+def wake_problem(text, dedupe):
+    if text.strip().casefold() in WAKE_PLACEHOLDERS:
+        return "message is a bare placeholder"
+    if len(text.strip()) < 20:
+        return "message must contain at least 20 characters after stripping whitespace"
+    if (dedupe or "").strip().casefold() in DEDUPE_PLACEHOLDERS:
+        return "--dedupe is a placeholder"
+    if UNFILLED_TEMPLATE.search(text):
+        return "message contains an unfilled template"
+    return None
+
+
+def caller_fields():
+    """Best-effort local attribution; never request or record the parent's full argv."""
+    ppid = os.getppid()
+    parent_comm = ""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "comm=", "-p", str(ppid)],
+            capture_output=True, text=True, timeout=0.5, check=True,
+        )
+        parent_comm = Path(result.stdout.strip()).name
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        pass
+    try:
+        cwd = Path.cwd().name
+    except OSError:
+        cwd = ""
+    return {"ppid": ppid, "parent_comm": parent_comm, "cwd": cwd}
 
 
 def config_dir():
@@ -320,11 +359,17 @@ def open_lock():
             time.sleep(0.1)
 
 
-def run_page(sev, text, title, url, dedupe, window, source, loud=None):
+def run_page(sev, text, title, url, dedupe, window, source, loud=None, incident=None):
     config, problem = load_config()
     if problem:
         print(f"page: {problem}", file=sys.stderr)
     host = short_hostname()
+    attribution = dict(host=host, source=clean(source or "unattributed"), asked=sev,
+                       incident=clean(incident["name"]) if incident else None, **caller_fields())
+    def finish(code, outcome, **fields):
+        if not support.audit(state_dir(), dict(attribution, outcome=outcome, **fields)):
+            print("page: audit unavailable", file=sys.stderr)
+        return code
     message = {
         "sev": sev,
         "text": clean(text),
@@ -333,7 +378,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
     }
     if not message["text"]:
         print("page: empty message", file=sys.stderr)
-        return 2
+        return finish(2, "refused", reason="empty_message")
     key = hashlib.sha256((dedupe or f"{message['title']}|{message['text']}").encode()).hexdigest()[:16]
     window = config["windows"][sev] if window is None else window
     cap = config["wake_cap_per_hour"]
@@ -346,9 +391,45 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
     with lock or contextlib.nullcontext():
         entries = read_log() if lock else []
         now = time.time()
-        if any(e["key"] == key and e.get("asked") == sev and now - e["at"] < window for e in entries):
+        policy_reason = "legacy"
+        if incident:
+            policy_path = state_dir() / "incidents" / (support.incident_key(source or "unattributed", incident["name"]) + ".json")
+            try:
+                if not lock:
+                    raise OSError("incident state unavailable")
+                previous = json.loads(policy_path.read_text()) if policy_path.exists() else {}
+                if not isinstance(previous, dict):
+                    raise ValueError("invalid incident state")
+                updated, effective, policy_reason, generation = support.incident_decision(
+                    previous, condition=incident["condition"], observed_at=incident["observed_at"], now=now,
+                    wake_after=incident["wake_after"], resolve_after=incident["resolve_after"],
+                    max_age=incident["max_age"], handling=incident["handling"],
+                    human_action=incident["human_action"], requested=sev)
+                policy_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                temp = policy_path.with_suffix(".tmp")
+                with os.fdopen(os.open(temp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600), "w") as handle:
+                    json.dump(updated, handle, allow_nan=False)
+                temp.replace(policy_path)
+            except (OSError, ValueError, KeyError, TypeError):
+                effective, policy_reason, generation = "info", "incident_state_unavailable", 0
+            attribution.update(condition=incident["condition"], handling=incident["handling"],
+                               observed_at=incident["observed_at"], policy=policy_reason,
+                               owner=clean(incident["owner"] or "unassigned"))
+            if effective is None:
+                print("page: deferred " + policy_reason)
+                return finish(0, "deferred", reason=policy_reason)
+            message["sev"] = effective
+            loud = effective == "wake"
+            # Dedupe is owned by incident+phase+severity, not caller counters.
+            key = support.incident_key(source or "unattributed", incident["name"]) + "-" + str(generation) + "-" + incident["condition"] + "-" + effective
+            window = max(window, 86400)
+            if effective == "wake":
+                message["text"] = clean(incident["human_action"] + ": " + text)
+            message["title"] = clean(title or f"{effective}: {source or host}")
+        dedupe_sev = message["sev"]
+        if any(e["key"] == key and e.get("asked") == message["sev"] and now - e["at"] < window for e in entries):
             print(f"page: suppressed repeat of {key} (window {window}s)")
-            return 0
+            return finish(0, "suppressed", reason=policy_reason, effective=message["sev"], key=key)
         if loud and sum(bool(e.get("rang")) and now - e["at"] < 3600 for e in entries) >= cap:
             print(f"page: over {cap} wakes an hour, sending as info", file=sys.stderr)
             capped = True
@@ -360,11 +441,11 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
             print(f"page: {failure}", file=sys.stderr)
         if backend is None:
             print("page: not sent, " + ("every backend failed" if failures else "no backend set up"), file=sys.stderr)
-            return 1
+            return finish(1, "failed", effective=message["sev"], reason="; ".join(failures) or "no_backend", key=key)
         if lock:
             entries.append(
-                {"at": now, "key": key, "name": clean(dedupe) if dedupe else None, "window": window, "asked": sev,
-                 "sev": message["sev"], "rang": loud, "backend": backend, "source": source}
+                {"at": now, "key": key, "name": clean(dedupe) if dedupe else None, "window": window, "asked": dedupe_sev,
+                 "sev": message["sev"], "rang": loud, "backend": backend, "source": clean(source) if source else None, **caller_fields()}
             )
             try:
                 write_log(entries)
@@ -378,7 +459,9 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
     elif loud and backend not in RINGS_THROUGH_MUTE:
         note = ", may not have rung"
     print(f"page: sent sev={message['sev']} via {backend}{note}")
-    return 0
+    return finish(0, "capped" if capped else "sent", effective=message["sev"], backend=backend,
+                  rang=bool(loud and backend in RINGS_THROUGH_MUTE), key=key,
+                  text=message["text"], url=message["url"], reason=policy_reason)
 
 
 def run_status():
@@ -397,6 +480,23 @@ def run_status():
 
 
 def main(argv):
+    if argv[:1] in (["history"], ["callers"]):
+        parser = argparse.ArgumentParser(prog="page " + argv[0])
+        parser.add_argument("--json", action="store_true")
+        if argv[0] == "history":
+            parser.add_argument("--source")
+            parser.add_argument("--limit", type=int, default=100)
+        else:
+            parser.add_argument("--scan", type=Path, help="candidate call sites under this root; no code contents")
+        args = parser.parse_args(argv[1:])
+        rows = (support.history(state_dir(), args.source, max(1, min(args.limit, 10000))) if argv[0] == "history"
+                else support.scan(args.scan) if args.scan else support.callers(state_dir()))
+        if args.json:
+            print(json.dumps(rows, indent=2))
+        else:
+            for row in rows:
+                print(json.dumps(row, sort_keys=True))
+        return 0
     if argv[:1] == ["status"]:
         argparse.ArgumentParser(prog="page status").parse_args(argv[1:])
         return run_status()
@@ -417,9 +517,38 @@ def main(argv):
     parser.add_argument("--dedupe", help="repeats of this key inside the window are suppressed")
     parser.add_argument("--window", type=int, help="seconds; defaults to the configured window for the severity")
     parser.add_argument("--source", help="who is paging, shown in the default title")
+    parser.add_argument("--incident", help="stable incident identity; enables managed escalation policy")
+    parser.add_argument("--condition", choices=["firing", "resolved", "unknown"], default="firing")
+    parser.add_argument("--observed-at", help="RFC3339 observation timestamp; required for incidents")
+    parser.add_argument("--human-action", help="concrete action only the human can take; required for incident wakes")
+    parser.add_argument("--handling", choices=["unhandled", "automatic", "human"], default="unhandled")
+    parser.add_argument("--owner", help="responder name; attribution, not proof of acknowledgement")
+    parser.add_argument("--wake-after", type=int, default=600, help="continuous firing seconds before wake (0 for verified urgent harm)")
+    parser.add_argument("--resolve-after", type=int, default=3600, help="continuous clear seconds to close/rearm")
+    parser.add_argument("--max-age", type=int, default=300, help="maximum observation age in seconds")
     parser.add_argument("message")
     args = parser.parse_args(argv)
-    return run_page(args.sev, args.message, args.title, args.url, args.dedupe, args.window, args.source)
+    incident = None
+    if args.window is not None and args.window < 0:
+        parser.error("--window must be nonnegative")
+    if args.incident:
+        if not args.source or not args.observed_at or min(args.wake_after, args.resolve_after) < 0 or args.max_age <= 0:
+            parser.error("incidents require --source, --observed-at and valid nonnegative timing")
+        try:
+            observed = support.timestamp(args.observed_at)
+        except ValueError as error:
+            parser.error(str(error))
+        incident = dict(name=args.incident, condition=args.condition, observed_at=observed,
+                        human_action=args.human_action, handling=args.handling, owner=args.owner,
+                        wake_after=args.wake_after, resolve_after=args.resolve_after, max_age=args.max_age)
+    if args.sev == "wake":
+        problem = wake_problem(args.message, args.dedupe)
+        if problem:
+            print(f"page: refusing wake: {problem}", file=sys.stderr)
+            support.audit(state_dir(), dict(host=short_hostname(), source=clean(args.source or "unattributed"),
+                          asked=args.sev, outcome="refused", reason=problem, **caller_fields()))
+            return 2
+    return run_page(args.sev, args.message, args.title, args.url, args.dedupe, args.window, args.source, incident=incident)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 # page
 
 Page a human from an agent or script. `page` adds what a one-line `curl` leaves out when agents are the ones calling:
-repeat suppression, a cap on how often the phone can ring, backend fallback, and secret masking. It's one Python file
-with no dependencies, so it still works when the things it reports on are down.
+repeat suppression, a cap on how often the phone can ring, backend fallback, and secret masking. It uses two small Python files
+with no third-party dependencies, so it still works when the things it reports on are down.
 
 ```sh
 page "build finished"
@@ -21,6 +21,7 @@ See [Limits](#limits).
    ```sh
    mkdir -p ~/.local/bin
    curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/agent-pager/main/page -o ~/.local/bin/page
+   curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/agent-pager/main/page_support.py -o ~/.local/bin/page_support.py
    chmod +x ~/.local/bin/page
    mkdir -p -m 700 ~/.config/page/secrets
    pbpaste > ~/.config/page/secrets/bark-key   # or write the file another way on Linux
@@ -70,7 +71,7 @@ you pass `--title` or `--source`, and `page test` always includes it.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | A backend accepted it, or it was suppressed as a repeat |
+| 0 | Accepted, suppressed, or deferred by incident policy; inspect the printed outcome |
 | 1 | Every backend failed, or none is set up |
 | 2 | Bad usage |
 
@@ -133,3 +134,71 @@ They run the real CLI against a local fake server, so nothing reaches a phone or
 ## License
 
 [MIT](LICENSE)
+
+
+## Managed incidents (0.3)
+
+Use one stable incident name, not a timestamp or a generated notification ID.
+Report each current observation (including recovery) at a cadence below
+`--max-age` (default 300 seconds):
+
+```sh
+page --source batch-custody --incident audio-custody --sev wake \
+  --condition firing --observed-at "2026-11-15T01:55:00+07:00" \
+  --human-action "Investigate persistent audio storage risk" \
+  --owner batch-responder --wake-after 600 --resolve-after 3600 \
+  --url https://example.org/incident "3 audio items lack verified storage; no automatic repair"
+```
+
+The first observation sends info. A wake needs fresh, continuous firing evidence
+for `--wake-after` seconds and a concrete `--human-action`. `--handling automatic`
+keeps it info while an effective recovery is running; an owner name alone does
+not establish recovery. The caller must stop claiming automatic handling if it
+fails. Use `--wake-after 0` only for verified imminent harm. Missing human action
+keeps an incident informational. Stale, future and unknown observations never
+wake or clear. Report `--condition resolved` until the recovery hold expires;
+brief clear/firing flaps retain one episode and restart the persistence clock.
+A gap beyond the evidence freshness budget restarts the firing clock.
+
+The action is prepended to a wake's body. State is per host, source and incident;
+it is not a distributed lock or proof of human acknowledgement. A restart keeps
+incident identity. Info and wake deliveries have separate dedupe identities;
+failed deliveries retry. Policy deferral prints `page: deferred <reason>` and
+exits 0. Suppression is also exit 0. Scripts must distinguish these from
+`page: sent`; exit 0 alone never proves a notification was sent.
+
+Install **both `page` and `page_support.py` in the same directory**. Keep legacy
+calls for emergency/manual use while migrating monitors; legacy wakes keep
+their existing behavior and are explicitly visible in the caller index.
+
+## Audit and caller inventory
+
+Every parsed send attempt records its outcome: sent, capped, suppressed,
+failed, refused, or deferred. Inspect without sending any notification:
+
+```sh
+page history --source batch-custody --limit 100 --json
+page callers --json
+page callers --scan /path/to/config-or-scripts --json
+```
+
+The runtime caller index groups observed sources, parent executable basenames,
+first/last activity, outcomes and legacy-call counts. A missing source appears as
+`unattributed`. The source scan lists candidate file/line/literal-source sites,
+including dormant scripts; it does not claim they are active or prove exhaustive
+coverage of dynamically assembled commands. It skips symlinks, secrets, caches
+and large files and never emits source text. Audit each host: these logs are
+local, not a fleet-wide total. Before a complete rollout, older installations
+and calls predating the upgrade are not represented.
+
+Audit storage is `~/.local/state/page/audit/` (or `PAGE_STATE_DIR/audit`). Daily
+JSONL files retain 30 days with at most four 2 MiB segments/day. Directories are
+0700 and new files 0600. It records masked transmitted text/URL for sent events,
+source, host, policy decision, incident, delivery result and parent executable
+basename; no parent argv or credentials are collected. As with lock-screen
+messages, do not put private customer data in a page. Audit failure warns but
+never blocks emergency transport. Parser errors before a call is formed and
+SIGKILL/process crashes are outside the durable audit guarantee. The short
+`sent.jsonl` remains the independent delivery/dedupe state.
+
+Tests use fake local backends only: `python3 -B -m unittest test_page test_incidents`.

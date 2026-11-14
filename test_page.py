@@ -55,6 +55,40 @@ class PageTest(unittest.TestCase):
         self.set_secret("ntfy-topic", NTFY_TOPIC)
         self.write_config({})
 
+    def test_incident_refuses_stale_wake_and_audits_deferral(self):
+        result = self.page("--sev", "wake", "--source", "batch", "--incident", "custody",
+                           "--observed-at", "2020-01-01T00:00:00Z", "--wake-after", "0",
+                           "--human-action", "Restore storage access", "Audio custody needs investigation")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("deferred stale_observation", result.stdout)
+        self.assertEqual(self.server.requests, [])
+        rows = json.loads(self.page("history", "--json").stdout)
+        self.assertEqual(rows[-1]["outcome"], "deferred")
+
+    def test_incident_info_then_urgent_wake_and_duplicate_suppression(self):
+        import datetime
+        observed = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        args = ("--sev", "wake", "--source", "batch", "--incident", "custody",
+                "--observed-at", observed, "--human-action", "Restore storage access")
+        result = self.page(*args, "Audio custody needs investigation")
+        self.assertIn("sev=info", result.stdout)
+        result = self.page(*args, "--wake-after", "0", "Confirmed missing audio needs investigation")
+        self.assertIn("sev=wake", result.stdout)
+        result = self.page(*args, "--wake-after", "0", "Confirmed missing audio needs investigation")
+        self.assertIn("suppressed", result.stdout)
+        self.assertEqual(self.backends(), ["ntfy", "bark"])
+        self.assertIn("Restore storage access", json.loads(self.server.requests[-1]["body"])["body"])
+        rows = json.loads(self.page("callers", "--json").stdout)
+        self.assertEqual(rows[0]["outcomes"], {"sent": 2, "suppressed": 1})
+
+    def test_backend_failure_is_audited_and_retry_is_not_suppressed(self):
+        self.server.failing = {"bark", "ntfy"}
+        self.assertEqual(self.page("--source", "worker", "Build failed; investigation needed").returncode, 1)
+        self.server.failing = set()
+        self.assertEqual(self.page("--source", "worker", "Build failed; investigation needed").returncode, 0)
+        rows = json.loads(self.page("history", "--json").stdout)
+        self.assertEqual([r["outcome"] for r in rows], ["failed", "sent"])
+
     def base_url(self):
         return f"http://127.0.0.1:{self.server.server_port}"
 
@@ -79,6 +113,83 @@ class PageTest(unittest.TestCase):
     def backends(self):
         return [request["backend"] for request in self.server.requests]
 
+    def test_wake_refuses_short_or_placeholder_messages_without_sending(self):
+        for text in ("", "   ", "x" * 19, "  " + "x" * 19 + "  ",
+                     "summary", "message", "body", "text", "test", "todo", "tbd", "placeholder"):
+            for message in (text, "  " + text.upper() + "  "):
+                with self.subTest(message=message):
+                    result = self.page("--sev", "wake", "--", message)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("page: refusing wake:", result.stderr)
+                    self.assertEqual(self.server.requests, [])
+                    self.assertFalse((self.root / "state/sent.jsonl").exists())
+
+    def test_wake_refuses_placeholder_dedupe_without_sending(self):
+        for key in ("key", "dedupe", "name", "id", "todo"):
+            for dedupe in (key, "  " + key.upper() + "  "):
+                with self.subTest(dedupe=dedupe):
+                    result = self.page("--sev", "wake", "--dedupe", dedupe,
+                                       "Production is down; restart needed")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--dedupe is a placeholder", result.stderr)
+                    self.assertEqual(self.server.requests, [])
+                    self.assertFalse((self.root / "state/sent.jsonl").exists())
+
+    def test_wake_refuses_unfilled_templates_without_sending(self):
+        for template in ("{summary}", "<summary>", "$SUMMARY", "%s", "${SUMMARY}",
+                         "{}", "<>", "{multi\nline}"):
+            with self.subTest(template=template):
+                # Even a template past the transmitted text's truncation limit must be refused.
+                result = self.page("--sev", "wake", "Production needs attention: " + "x " * 130 + template)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("message contains an unfilled template", result.stderr)
+                self.assertEqual(self.server.requests, [])
+                self.assertFalse((self.root / "state/sent.jsonl").exists())
+
+    def test_wake_accepts_twenty_characters_after_stripping(self):
+        result = self.page("--sev", "wake", "--dedupe", "incident-42", "  " + "x " * 9 + "xx  ")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.backends(), ["bark"])
+        self.assertEqual(json.loads(self.server.requests[0]["body"])["level"], "critical")
+
+    def test_info_allows_wake_placeholders_and_templates(self):
+        for text in ("summary", "{summary}", "<summary>", "$SUMMARY", "%s"):
+            result = self.page("--dedupe", "key", "--window", "0", text)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.server.requests[-1]["body"].decode(), text)
+        self.assertEqual(self.backends(), ["ntfy"] * 5)
+
+    def test_sent_rows_record_caller_basenames(self):
+        for args in (("Build finished",), ("--sev", "wake", "Production is down; restart needed"),
+                     ("test", "--sev", "wake")):
+            result = self.page(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        entries = [json.loads(line) for line in (self.root / "state/sent.jsonl").read_text().splitlines()]
+        self.assertEqual(len(entries), 3)
+        for entry in entries:
+            self.assertEqual(entry["ppid"], os.getpid())
+            self.assertTrue(entry["parent_comm"])
+            self.assertEqual(entry["parent_comm"], Path(entry["parent_comm"]).name)
+            self.assertEqual(entry["cwd"], Path.cwd().name)
+
+    def test_caller_lookup_is_bounded_private_and_fails_open(self):
+        loader = importlib.machinery.SourceFileLoader("page_module", str(PAGE))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("page_module", loader))
+        loader.exec_module(module)
+        with unittest.mock.patch.object(module.os, "getppid", return_value=123), \
+                unittest.mock.patch.object(module.subprocess, "run") as run:
+            run.return_value.stdout = "/some/private/path/zsh\n"
+            self.assertEqual(module.caller_fields(), {"ppid": 123, "parent_comm": "zsh", "cwd": Path.cwd().name})
+            run.assert_called_once_with(["ps", "-o", "comm=", "-p", "123"],
+                                        capture_output=True, text=True, timeout=0.5, check=True)
+            for error in (FileNotFoundError(), subprocess.TimeoutExpired("ps", 0.5),
+                          subprocess.CalledProcessError(1, "ps"), UnicodeError()):
+                with self.subTest(error=type(error).__name__):
+                    run.side_effect = error
+                    self.assertEqual(module.caller_fields()["parent_comm"], "")
+            with unittest.mock.patch.object(module.Path, "cwd", side_effect=FileNotFoundError()):
+                self.assertEqual(module.caller_fields()["cwd"], "")
+
     def test_this_machines_own_name_stays_readable(self):
         name = "DavidMacSudioM1s-Mac-Studio"
         loader = importlib.machinery.SourceFileLoader("page_module", str(PAGE))
@@ -89,12 +200,12 @@ class PageTest(unittest.TestCase):
             self.assertEqual(module.mask("x DavidMacSudioM1s-Mac-Studio7 y"), "x [masked] y")
 
     def test_wake_rings_on_bark(self):
-        result = self.page("--sev", "wake", "--url", "https://example.test/card", "lead is down")
+        result = self.page("--sev", "wake", "--url", "https://example.test/card", "Lead is down; takeover needs attention")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.backends(), ["bark"])
         body = json.loads(self.server.requests[0]["body"])
         self.assertEqual(self.server.requests[0]["secret"], BARK_KEY)
-        self.assertEqual((body["level"], body["call"], body["body"]), ("critical", "1", "lead is down"))
+        self.assertEqual((body["level"], body["call"], body["body"]), ("critical", "1", "Lead is down; takeover needs attention"))
         self.assertEqual(body["url"], "https://example.test/card")
 
     def test_info_goes_to_ntfy_at_normal_priority(self):
@@ -105,7 +216,7 @@ class PageTest(unittest.TestCase):
 
     def test_wake_falls_back_to_max_priority_ntfy(self):
         self.server.failing.add("bark")
-        result = self.page("--sev", "wake", "lead is down")
+        result = self.page("--sev", "wake", "Lead is down; takeover needs attention")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.backends(), ["bark", "ntfy"])
         self.assertEqual(self.server.requests[1]["headers"]["Priority"], "5")
@@ -113,12 +224,12 @@ class PageTest(unittest.TestCase):
         self.assertIn("via ntfy, may not have rung", result.stdout)
 
     def test_a_wake_that_rang_does_not_hedge_and_a_quiet_test_says_so(self):
-        self.assertEqual(self.page("--sev", "wake", "lead is down").stdout.strip(), "page: sent sev=wake via bark")
+        self.assertEqual(self.page("--sev", "wake", "Lead is down; takeover needs attention").stdout.strip(), "page: sent sev=wake via bark")
         self.assertIn("via bark, quiet", self.page("test", "--sev", "wake").stdout)
 
     def test_missing_backend_is_skipped(self):
         (self.root / "config/secrets/bark-key").unlink()
-        self.assertEqual(self.page("--sev", "wake", "lead is down").returncode, 0)
+        self.assertEqual(self.page("--sev", "wake", "Lead is down; takeover needs attention").returncode, 0)
         self.assertEqual(self.backends(), ["ntfy"])
 
     def test_no_backend_set_up_fails(self):
@@ -129,26 +240,26 @@ class PageTest(unittest.TestCase):
         self.assertIn("no backend set up", result.stderr)
 
     def test_repeat_is_suppressed_and_a_new_key_is_not(self):
-        self.page("--sev", "wake", "--dedupe", "lead", "lead is down")
-        repeat = self.page("--sev", "wake", "--dedupe", "lead", "lead is still down")
+        self.page("--sev", "wake", "--dedupe", "lead", "Lead is down; takeover needs attention")
+        repeat = self.page("--sev", "wake", "--dedupe", "lead", "lead is still down: incident needs attention")
         self.assertEqual(repeat.returncode, 0)
         self.assertIn("suppressed", repeat.stdout)
         self.assertEqual(len(self.server.requests), 1)
-        self.page("--sev", "wake", "--dedupe", "prod", "prod tripped")
+        self.page("--sev", "wake", "--dedupe", "prod", "prod tripped: incident needs attention")
         self.assertEqual(len(self.server.requests), 2)
 
     def test_failed_send_is_not_recorded_so_a_retry_goes_out(self):
         self.server.failing.update({"bark", "ntfy"})
-        first = self.page("--sev", "wake", "--dedupe", "lead", "lead is down")
+        first = self.page("--sev", "wake", "--dedupe", "lead", "Lead is down; takeover needs attention")
         self.assertEqual(first.returncode, 1)
         self.server.failing.clear()
-        self.assertEqual(self.page("--sev", "wake", "--dedupe", "lead", "lead is down").returncode, 0)
+        self.assertEqual(self.page("--sev", "wake", "--dedupe", "lead", "Lead is down; takeover needs attention").returncode, 0)
         self.assertEqual(self.backends()[-1], "bark")
 
     def test_wake_over_the_hourly_cap_goes_out_as_info(self):
         for number in range(6):
-            self.assertEqual(self.page("--sev", "wake", f"alert {number}").returncode, 0)
-        result = self.page("--sev", "wake", "alert 7")
+            self.assertEqual(self.page("--sev", "wake", f"alert {number}: incident needs attention").returncode, 0)
+        result = self.page("--sev", "wake", "alert 7: incident needs attention")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("sending as info", result.stderr)
         self.assertEqual(self.backends(), ["bark"] * 6 + ["ntfy"])
@@ -163,9 +274,9 @@ class PageTest(unittest.TestCase):
 
     def test_secrets_never_reach_output_or_log(self):
         self.server.failing.update({"bark", "ntfy"})
-        failed = self.page("--sev", "wake", "lead is down")
+        failed = self.page("--sev", "wake", "Lead is down; takeover needs attention")
         self.server.failing.clear()
-        sent = self.page("--sev", "wake", "lead is down")
+        sent = self.page("--sev", "wake", "Lead is down; takeover needs attention")
         status = self.page("status")
         log = (self.root / "state/sent.jsonl").read_text()
         for text in (failed.stdout, failed.stderr, sent.stdout, sent.stderr, status.stdout, status.stderr, log):
@@ -189,9 +300,9 @@ class PageTest(unittest.TestCase):
             "wake_cap_per_hour": 1,
             "backends": {"bark": {"volume": 9}},
         })
-        self.page("--sev", "wake", "first")
+        self.page("--sev", "wake", "first: incident needs attention")
         self.assertEqual(self.backends(), ["ntfy"])
-        self.page("--sev", "wake", "second")
+        self.page("--sev", "wake", "second: incident needs attention")
         self.assertEqual(self.backends(), ["ntfy", "bark"])
         self.page("same")
         self.page("same")
@@ -205,7 +316,7 @@ class PageTest(unittest.TestCase):
         elsewhere.write_text("elsewhere-key\n")
         (self.root / "config/secrets/bark-key").unlink()
         self.write_config({"backends": {"bark": {"secret_file": str(elsewhere)}}})
-        self.assertEqual(self.page("--sev", "wake", "lead is down").returncode, 0)
+        self.assertEqual(self.page("--sev", "wake", "Lead is down; takeover needs attention").returncode, 0)
         self.assertEqual(self.server.requests[0]["secret"], "elsewhere-key")
 
     def test_unusable_config_is_reported_and_cannot_silence_a_page(self):
@@ -241,7 +352,7 @@ class PageTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.write_config({"backends": {"bark": {"secret_file": str(elsewhere)}}, **bad})
                 self.server.requests.clear()
-                result = self.page("--sev", "wake", "--window", "0", "lead is down")
+                result = self.page("--sev", "wake", "--window", "0", "Lead is down; takeover needs attention")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("ignored", result.stderr)
                 self.assertEqual(self.server.requests[0]["secret"], "elsewhere-key")
@@ -251,7 +362,7 @@ class PageTest(unittest.TestCase):
         elsewhere.write_text("elsewhere-key\n")
         (self.root / "config/secrets/bark-key").unlink()
         self.write_config({"backends": {"bark": {"secret_file": str(elsewhere), "volume": 11}}})
-        result = self.page("--sev", "wake", "lead is down")
+        result = self.page("--sev", "wake", "Lead is down; takeover needs attention")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.server.requests[0]["secret"], "elsewhere-key")
         self.assertEqual(json.loads(self.server.requests[0]["body"])["volume"], 5)
@@ -272,20 +383,20 @@ class PageTest(unittest.TestCase):
         directory = self.root / "bad"
         directory.mkdir()
         (directory / "config.json").write_text("{not json")
-        result = self.page("--sev", "wake", "lead is down", config_dir=directory)
+        result = self.page("--sev", "wake", "Lead is down; takeover needs attention", config_dir=directory)
         self.assertEqual(result.returncode, 1)
         self.assertIn("ignored", result.stderr)
         self.assertIn("no backend set up", result.stderr)
 
     def test_truncated_response_falls_back(self):
         self.server.truncating.add("bark")
-        result = self.page("--sev", "wake", "lead is down")
+        result = self.page("--sev", "wake", "Lead is down; takeover needs attention")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.backends(), ["bark", "ntfy"])
 
     def test_unusable_state_directory_still_sends(self):
         (self.root / "state").write_text("a file where the directory should be")
-        result = self.page("--sev", "wake", "lead is down")
+        result = self.page("--sev", "wake", "Lead is down; takeover needs attention")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("state unavailable", result.stderr)
         self.assertEqual(self.backends(), ["bark"])
@@ -293,7 +404,7 @@ class PageTest(unittest.TestCase):
     def test_malformed_state_lines_are_ignored(self):
         (self.root / "state").mkdir()
         (self.root / "state/sent.jsonl").write_text('[]\n{"at": 1}\n{"at": "x", "key": 1}\nnot json\n')
-        self.assertEqual(self.page("--sev", "wake", "lead is down").returncode, 0)
+        self.assertEqual(self.page("--sev", "wake", "Lead is down; takeover needs attention").returncode, 0)
         self.assertEqual(self.page("status").returncode, 0)
         self.assertEqual(self.backends(), ["bark"])
 
@@ -301,7 +412,7 @@ class PageTest(unittest.TestCase):
         (self.root / "state").mkdir()
         with open(self.root / "state/lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            result = self.page("--sev", "wake", "lead is down")
+            result = self.page("--sev", "wake", "Lead is down; takeover needs attention")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("state unavailable", result.stderr)
         self.assertEqual(self.backends(), ["bark"])
@@ -310,7 +421,7 @@ class PageTest(unittest.TestCase):
         self.page(
             "--sev", "wake",
             "--url", "https://me:pw@example.test/owner/repo/pull/12345/long-readable-path?sig=abcdefghijklmnopqrstuvwxyz012345&a=1",
-            "lead is down",
+            "Lead is down; takeover needs attention",
         )
         url = json.loads(self.server.requests[0]["body"])["url"]
         self.assertTrue(url.startswith("https://example.test/owner/repo/pull/12345/long-readable-path?"), url)
@@ -325,14 +436,14 @@ class PageTest(unittest.TestCase):
                 self.assertEqual(self.backends()[-1], "ntfy")
 
     def test_url_encodes_spaces_in_its_path(self):
-        self.page("--sev", "wake", "--url", " https://example.test/incident room ", "lead is down")
+        self.page("--sev", "wake", "--url", " https://example.test/incident room ", "Lead is down; takeover needs attention")
         self.assertEqual(json.loads(self.server.requests[0]["body"])["url"], "https://example.test/incident%20room")
 
     def test_repeats_downgraded_by_the_cap_are_still_suppressed(self):
         self.write_config({"wake_cap_per_hour": 1})
-        self.page("--sev", "wake", "first")
-        self.page("--sev", "wake", "--dedupe", "looping", "second")
-        repeat = self.page("--sev", "wake", "--dedupe", "looping", "second again")
+        self.page("--sev", "wake", "first: incident needs attention")
+        self.page("--sev", "wake", "--dedupe", "looping", "second: incident needs attention")
+        repeat = self.page("--sev", "wake", "--dedupe", "looping", "second again: incident needs attention")
         self.assertIn("suppressed", repeat.stdout)
         self.assertEqual(self.backends(), ["bark", "ntfy"])
 
@@ -340,7 +451,7 @@ class PageTest(unittest.TestCase):
         self.write_config({"wake_cap_per_hour": 1})
         self.page("test", "--sev", "wake")
         self.page("test", "--sev", "wake")
-        self.page("--sev", "wake", "lead is down")
+        self.page("--sev", "wake", "Lead is down; takeover needs attention")
         self.assertEqual(json.loads(self.server.requests[-1]["body"])["level"], "critical")
 
     def test_short_credentials_are_masked(self):
@@ -385,7 +496,7 @@ class PageTest(unittest.TestCase):
                 self.assertIn("[masked]", body)
 
     def test_url_query_keeps_a_readable_value(self):
-        self.page("--sev", "wake", "--url", "https://example.test/c?card=agent-fleet-resilience-david-10-30", "x")
+        self.page("--sev", "wake", "--url", "https://example.test/c?card=agent-fleet-resilience-david-10-30", "x: incident needs attention")
         self.assertEqual(
             json.loads(self.server.requests[0]["body"])["url"],
             "https://example.test/c?card=agent-fleet-resilience-david-10-30",
@@ -412,7 +523,7 @@ class PageTest(unittest.TestCase):
         self.assertEqual(self.page("status").returncode, 1)
 
     def test_status_shows_the_key_as_given_and_omits_a_missing_source(self):
-        self.page("--dedupe", "lead-down", "--source", "failover", "lead is down")
+        self.page("--dedupe", "lead-down", "--source", "failover", "Lead is down; takeover needs attention")
         self.page("no key here")
         lines = self.page("status").stdout.splitlines()
         self.assertIn("key=lead-down source=failover", lines[-2])
@@ -431,8 +542,8 @@ class PageTest(unittest.TestCase):
 
     def test_a_capped_wake_says_on_stdout_that_it_did_not_ring(self):
         self.write_config({"wake_cap_per_hour": 1})
-        self.page("--sev", "wake", "first")
-        self.assertIn("via ntfy, capped, did not ring", self.page("--sev", "wake", "second").stdout)
+        self.page("--sev", "wake", "first: incident needs attention")
+        self.assertIn("via ntfy, capped, did not ring", self.page("--sev", "wake", "second: incident needs attention").stdout)
 
     def test_help_lists_the_subcommands(self):
         output = self.page("--help").stdout
@@ -444,12 +555,12 @@ class PageTest(unittest.TestCase):
         self.assertEqual(self.server.requests[0]["body"], b"status")
 
     def test_url_path_loses_known_credentials_and_keeps_hashes(self):
-        self.page("--sev", "wake", "--url", "https://example.test/ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890/x", "a")
+        self.page("--sev", "wake", "--url", "https://example.test/ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890/x", "a: incident needs attention")
         self.assertEqual(json.loads(self.server.requests[-1]["body"])["url"], "https://example.test/[masked]/x")
-        self.page("--sev", "wake", "--url", "https://example.test/download/token=abc123", "c")
+        self.page("--sev", "wake", "--url", "https://example.test/download/token=abc123", "c: incident needs attention")
         self.assertNotIn("abc123", json.loads(self.server.requests[-1]["body"])["url"])
         commit = "https://example.test/o/r/commit/0ee5a15c0ee5a15c0ee5a15c0ee5a15c0ee5a15c"
-        self.page("--sev", "wake", "--url", commit, "b")
+        self.page("--sev", "wake", "--url", commit, "b: incident needs attention")
         self.assertEqual(json.loads(self.server.requests[-1]["body"])["url"], commit)
 
     def test_status_rejects_extra_arguments(self):
