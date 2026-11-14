@@ -81,6 +81,25 @@ class PageTest(unittest.TestCase):
         rows = json.loads(self.page("callers", "--json").stdout)
         self.assertEqual(rows[0]["outcomes"], {"deferred": 1, "sent": 1, "suppressed": 1})
 
+    def test_capped_incident_can_ring_when_hourly_capacity_returns(self):
+        import datetime, time
+        self.write_config({"wake_cap_per_hour": 1})
+        self.page("--sev", "wake", "--dedupe", "other-urgent", "Production is down; human action needed")
+        observed = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        args = ("--sev", "wake", "--source", "batch", "--incident", "custody",
+                "--observed-at", observed, "--human-action", "Restore storage access", "--wake-after", "0",
+                "Confirmed missing audio needs investigation")
+        self.assertIn("capped", self.page(*args).stdout)
+        self.assertIn("suppressed", self.page(*args).stdout)
+        path = self.root / "state/sent.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        for row in rows:
+            if row.get("rang"):
+                row["at"] = time.time() - 3601
+        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        self.assertIn("sent sev=wake", self.page(*args).stdout)
+        self.assertEqual(self.backends(), ["bark", "ntfy", "bark"])
+
     def test_backend_failure_is_audited_and_retry_is_not_suppressed(self):
         self.server.failing = {"bark", "ntfy"}
         self.assertEqual(self.page("--source", "worker", "Build failed; investigation needed").returncode, 1)

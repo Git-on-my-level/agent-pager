@@ -52,7 +52,8 @@ class IncidentTest(unittest.TestCase):
         self.assertEqual(state["first_seen"], 1120)
         self.assertIsNone(sev)
         state, _, _, _ = self.decision(state, at=1180, condition="resolved")
-        state, sev, reason, _ = self.decision(state, at=4780, condition="resolved")
+        for at in range(1240, 4840, 60):
+            state, sev, reason, _ = self.decision(state, at=at, condition="resolved")
         self.assertEqual((sev, reason), (None, "resolved"))
         self.assertFalse(state["active"])
         self.assertEqual(self.decision(state, at=4840)[3], episode + 1)
@@ -62,6 +63,14 @@ class IncidentTest(unittest.TestCase):
         state = self.decision(state, at=1060, condition="resolved", resolve_after=0)[0]
         self.assertFalse(state["active"])
         self.assertEqual(self.decision(state, at=1120, condition="resolved")[1:3], ("info", "resolved"))
+
+    def test_recovery_gap_restarts_debounce(self):
+        state = dict(self.decision()[0], notified=True)
+        state = self.decision(state, at=1060, condition="resolved")[0]
+        state, severity, reason, _ = self.decision(state, at=4660, condition="resolved")
+        self.assertEqual(state["clear_since"], 4660)
+        self.assertTrue(state["active"])
+        self.assertIsNone(severity)
 
     def test_gap_resets_continuous_risk_clock(self):
         state = self.decision()[0]

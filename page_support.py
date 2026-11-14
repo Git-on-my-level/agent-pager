@@ -137,6 +137,9 @@ def incident_decision(previous, *, condition, observed_at, now, wake_after=600,
             # Keep retrying a failed resolution delivery with the same identity;
             # transport dedupe suppresses it after acceptance.
             return state, "info" if state.get("notified") else None, "resolved" if generation else "already_resolved", generation
+        if observed_at - state.get("last_resolved", observed_at) > max_age:
+            state.pop("clear_since", None)
+        state["last_resolved"] = observed_at
         state.setdefault("clear_since", observed_at)
         if observed_at - state["clear_since"] < resolve_after:
             return state, None, "recovery_debounce", generation

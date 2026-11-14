@@ -426,6 +426,14 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None, incident=
             if effective == "wake":
                 message["text"] = clean(incident["human_action"] + ": " + text)
             message["title"] = clean(title or f"{effective}: {source or host}")
+        if incident and loud and sum(bool(e.get("rang")) and now - e["at"] < 3600 for e in entries) >= cap:
+            # Capped info is not a wake acknowledgement. Once the cap clears,
+            # retry the same incident's wake rather than suppressing it all day.
+            capped = True
+            message["sev"] = "info"
+            message["title"] = clean("wake cap: " + message["title"])
+            loud = False
+            window = min(window, 3600)
         dedupe_sev = message["sev"]
         if any(e["key"] == key and e.get("asked") == message["sev"] and now - e["at"] < window for e in entries):
             print(f"page: suppressed repeat of {key} (window {window}s)")
@@ -454,7 +462,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None, incident=
         if lock:
             entries.append(
                 {"at": now, "key": key, "name": clean(dedupe) if dedupe else None, "window": window, "asked": dedupe_sev,
-                 "sev": message["sev"], "rang": loud, "backend": backend, "source": clean(source) if source else None, **caller_fields()}
+                 "sev": message["sev"], "rang": bool(loud and backend in RINGS_THROUGH_MUTE), "backend": backend, "source": clean(source) if source else None, **caller_fields()}
             )
             try:
                 write_log(entries)
