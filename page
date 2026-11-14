@@ -463,7 +463,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None, incident=
         if lock:
             entries.append(
                 {"at": now, "key": key, "name": clean(dedupe) if dedupe else None, "window": window, "asked": dedupe_sev,
-                 "sev": message["sev"], "rang": bool(loud and backend in RINGS_THROUGH_MUTE), "backend": backend, "source": clean(source) if source else None, **caller_fields()}
+                 "sev": message["sev"], "rang": bool(loud and backend in RINGS_THROUGH_MUTE) if incident else loud, "backend": backend, "source": clean(source) if source else None, **caller_fields()}
             )
             try:
                 write_log(entries)
